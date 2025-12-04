@@ -1,3 +1,4 @@
+/* parser.y - Analizador sintactico + semantico con scopes y estructuras de control */
 %{
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,73 +7,152 @@
 int yylex(void);
 void yyerror(const char *s);
 extern FILE *yyin;
+extern int linea;   /* contador de lineas definido en lexer.l */
 
-/* Tipos de simbolos */
-typedef enum { SYM_VAR, SYM_FUNC } SymKind;
+/* ============================
+   TIPOS Y TABLA DE SIMBOLOS
+   ============================ */
+
+/* tipos semanticos como enteros */
+enum {
+    TYPE_INT = 1,
+    TYPE_FLOAT,
+    TYPE_DOUBLE,
+    TYPE_CHAR,
+    TYPE_VOID,
+    TYPE_UNKNOWN
+};
+
+/* clase de simbolo */
+enum {
+    SYM_VAR = 1,
+    SYM_FUNC
+};
 
 typedef struct Symbol {
-    char *name;
-    SymKind kind;
-    int param_count;        /* solo para funciones */
+    char      *name;
+    int        kind;        /* SYM_VAR o SYM_FUNC */
+    int        type;        /* uno de TYPE_* */
+    int        param_count; /* solo para funciones */
     struct Symbol *next;
 } Symbol;
 
+/* Scope (ambito): lista de simbolos + padre */
 typedef struct Scope {
     Symbol *symbols;
     struct Scope *parent;
 } Scope;
 
+/* Puntero al scope actual (pila de scopes encadenada) */
 Scope *current_scope = NULL;
-Symbol *current_function = NULL;
-int semantic_errors = 0;
 
-/* Prototipos */
-void init_scopes(void);
-void enter_scope(void);
-void leave_scope(void);
-Symbol* lookup_symbol(const char *name);
-Symbol* lookup_symbol_current(const char *name);
-Symbol* add_symbol(const char *name, SymKind kind);
-void declare_variable(const char *name);
-Symbol* declare_function(const char *name);
-void declare_param(const char *name);
-void check_var_use(const char *name);
-void check_function_call(const char *name, int arg_count);
-void semantic_error(const char *msg, const char *name);
+/* funcion actual (para guardar param_count) */
+Symbol *current_function = NULL;
+
+/* ultimo numero de parametros visto (para funciones) */
+int last_param_count = 0;
+
+int  semantic_errors = 0;
+
+/* prototipos */
+void    init_scopes(void);
+void    enter_scope(void);
+void    leave_scope(void);
+Symbol *lookup_symbol(const char *name);          /* busca en todos los scopes */
+Symbol *lookup_symbol_current(const char *name);  /* busca solo en scope actual */
+Symbol *add_symbol(const char *name, int kind, int type);
+void    sem_error(const char *msg, const char *id);
+
 %}
 
-/* Valores semanticos */
+/* ------------------------------
+   VALORES SEMANTICOS
+   ------------------------------ */
 %union {
-    char* str;
-    int   num;
+    int ival;        /* para NUMBER */
+    char *str;       /* para ID */
+    int ttype;       /* para tipos y expresiones (TYPE_*) */
+    int nparams;     /* para contar parametros/argumentos */
 }
 
-/* Tokens */
-%token INCLUDE INT RETURN
-%token <str> ID
-%token <num> NUMBER
+/* ------------------------------
+   TOKENS (deben coincidir con lexer.l)
+   ------------------------------ */
+%token INCLUDE
+%token DEFINE
 
-/* Tipos de no terminales */
-%type <str> type
-%type <num> arg_list_opt arg_list
+%token INT FLOAT DOUBLE CHAR VOID SHORT
+%token RETURN
+
+%token IF ELSE
+%token FOR WHILE DO
+%token INCREMENT
+
+%token <str> ID
+%token <ival> NUMBER
+
+/* Precedencia de operadores aritmeticos */
+%left '+' '-'
+%left '*' '/'
+
+/* Para resolver el "dangling else" */
+%nonassoc LOWER_THAN_ELSE
+%nonassoc ELSE
+
+/* Tipos semanticos de no terminales */
+%type <ttype> expr type
+%type <nparams> param_list param_list_opt param
+%type <nparams> arg_list arg_list_opt
 
 %%
 
-/* programa = includes + declaraciones globales + funciones */
+/* programa = lineas de preprocesador + globales + funciones */
 program:
-      includes global_list function_list
+      preprocessor_opt global_list function_list
     {
         printf("=== Analisis sintactico completado ===\n");
+        if (semantic_errors == 0)
+            printf("=== Analisis semantico: SIN ERRORES ===\n");
+        else
+            printf("=== Analisis semantico: %d error(es) ===\n", semantic_errors);
     }
     ;
 
-/* lineas de include (opcionales) */
-includes:
+/* lineas de preprocesador: includes y defines (opcionales) */
+preprocessor_opt:
       /* vacio */
-    | includes INCLUDE
+    | preprocessor_opt preprocessor_line
     ;
 
-/* declaraciones globales */
+/* Directivas para include y define */
+preprocessor_line:
+      '#' INCLUDE '<' ID '.' ID '>'
+        { printf("Include: <%s.%s>\n", $4, $6); }
+    | '#' INCLUDE '<' ID '>'
+        { printf("Include: <%s>\n", $4); }
+    | '#' DEFINE ID NUMBER
+        {
+            printf("Define: %s = %d\n", $3, $4);
+            /* tratamos #define ID NUM como constante entera global */
+            if (lookup_symbol_current($3)) {
+                sem_error("redeclaracion de constante/identificador", $3);
+            } else {
+                add_symbol($3, SYM_VAR, TYPE_INT);
+            }
+        }
+    | '#' DEFINE ID
+        {
+            printf("Define: %s\n", $3);
+            /* constante sin valor especifico */
+            if (lookup_symbol_current($3)) {
+                sem_error("redeclaracion de constante/identificador", $3);
+            } else {
+                add_symbol($3, SYM_VAR, TYPE_UNKNOWN);
+            }
+        }
+    ;
+
+/* declaraciones globales (opcionales) */
 global_list:
       /* vacio */
     | global_list global_decl
@@ -81,75 +161,119 @@ global_list:
 global_decl:
       type ID ';'
     {
-        declare_variable($2);
-        printf("Declaracion global;\n");
-    }
-    | type ID '=' expr ';'
-    {
-        declare_variable($2);
-        printf("Declaracion global con asignacion;\n");
+        /* redeclaracion solo si el nombre ya existe en el scope GLOBAL */
+        if (lookup_symbol_current($2)) {
+            sem_error("redeclaracion de variable global", $2);
+        } else {
+            add_symbol($2, SYM_VAR, $1);
+        }
+        printf("Declaracion global: %s\n", $2);
     }
     ;
 
-/* lista de funciones */
+/* tipos de dato */
+type:
+      INT    { $$ = TYPE_INT; }
+    | FLOAT  { $$ = TYPE_FLOAT; }
+    | DOUBLE { $$ = TYPE_DOUBLE; }
+    | CHAR   { $$ = TYPE_CHAR; }
+    | VOID   { $$ = TYPE_VOID; }
+    | SHORT  { $$ = TYPE_INT; }   /* tratamos short como int */
+    ;
+
+/* lista de funciones (al menos 1) */
 function_list:
       function_def
     | function_list function_def
     ;
 
-/* tipo base (solo int para simplificar) */
-type:
-      INT         { $$ = "int"; }
-    ;
-
-/* definicion de funcion: int id ( params ) { ... } */
+/* definicion de funcion con manejo de scopes:
+   - se declara la funcion en el scope global
+   - se crea un scope para la funcion (parametros)
+   - dentro del bloque se crea otro scope (variables locales y bloques anidados)
+*/
 function_def:
-      type ID '('
-        {
-            /* Declarar funcion en el scope global y abrir scope nuevo para su cuerpo */
-            current_function = declare_function($2);
-            enter_scope();
-        }
+      type ID
+      {
+          /* estamos en scope global */
+          Symbol *f = lookup_symbol_current($2);
+          if (f) {
+              if (f->kind == SYM_FUNC)
+                  sem_error("redeclaracion de funcion", $2);
+              else
+                  sem_error("identificador ya usado como variable", $2);
+          } else {
+              f = add_symbol($2, SYM_FUNC, $1);
+          }
+          current_function = f;
+      }
+      '('
+      {
+          /* nuevo scope para parametros de la funcion */
+          enter_scope();
+          last_param_count = 0;
+      }
       param_list_opt ')' block
-        {
-            /* cerrar scope de la funcion */
-            current_function = NULL;
-            leave_scope();
-            printf("Funcion;\n");
-        }
+    {
+        if (current_function)
+            current_function->param_count = last_param_count;
+
+        /* al terminar el bloque, hemos regresado al scope de la funcion;
+           ahora salimos del scope de la funcion */
+        leave_scope();
+
+        printf("Funcion: %s\n", $2);
+        current_function = NULL;
+    }
     ;
 
-/* parametros de la funcion */
+/* parametros */
 param_list_opt:
       /* vacio */
+    {
+        $$ = 0;
+        last_param_count = 0;
+    }
     | param_list
+    {
+        $$ = $1;
+        last_param_count = $1;
+    }
     ;
 
 param_list:
-      param
-    | param_list ',' param
+      param                { $$ = $1; }
+    | param_list ',' param { $$ = $1 + $3; }
     ;
 
 param:
       type ID
     {
-        declare_param($2);
-        printf("Parametro;\n");
+        /* solo revisamos redeclaracion en el scope ACTUAL (de la funcion) */
+        if (lookup_symbol_current($2)) {
+            sem_error("redeclaracion de parametro/variable", $2);
+        } else {
+            add_symbol($2, SYM_VAR, $1);
+        }
+        printf("Parametro: %s\n", $2);
+        $$ = 1;
     }
     ;
 
-/* bloque con vars locales e instrucciones */
+/* bloque con declaraciones locales y sentencias
+   Cada bloque crea su propio scope (anidado).
+*/
 block:
-      '{' 
-        {
-            /* nuevo scope para el bloque */
-            enter_scope();
-        }
-      local_decls stmt_list '}'
-        {
-            leave_scope();
-            printf("Bloque de codigo;\n");
-        }
+      '{'
+      {
+          enter_scope();   /* nuevo scope para el bloque */
+      }
+      local_decls stmt_list
+      '}'
+    {
+        printf("Bloque de codigo\n");
+        leave_scope();     /* salir del scope del bloque */
+    }
     ;
 
 local_decls:
@@ -160,13 +284,26 @@ local_decls:
 local_decl:
       type ID ';'
     {
-        declare_variable($2);
-        printf("Variable local;\n");
+        /* redeclaracion solo en el scope actual (bloque o funcion) */
+        if (lookup_symbol_current($2)) {
+            sem_error("redeclaracion de variable local/local-global", $2);
+        } else {
+            add_symbol($2, SYM_VAR, $1);
+        }
+        printf("Variable local: %s\n", $2);
     }
     | type ID '=' expr ';'
     {
-        declare_variable($2);
-        printf("Variable local con asignacion;\n");
+        if (lookup_symbol_current($2)) {
+            sem_error("redeclaracion de variable local/local-global", $2);
+        } else {
+            Symbol *v = add_symbol($2, SYM_VAR, $1);
+            if (v->type != $4 && $4 != TYPE_UNKNOWN) {
+                printf("Advertencia semantica (linea %d): tipo incompatible en inicializacion de %s\n",
+                       linea, $2);
+            }
+        }
+        printf("Variable local con asignacion: %s\n", $2);
     }
     ;
 
@@ -176,40 +313,151 @@ stmt_list:
     | stmt_list stmt
     ;
 
-/* sentencias (instrucciones) */
+/* sentencias */
 stmt:
       ID '=' expr ';'
     {
-        check_var_use($1);
-        printf("Asignacion;\n");
+        Symbol *v = lookup_symbol($1);
+        if (!v) {
+            sem_error("asignacion a variable no declarada", $1);
+        } else if (v->kind != SYM_VAR) {
+            sem_error("asignacion a identificador que no es variable", $1);
+        } else if (v->type != $3 && $3 != TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): tipos distintos en asignacion a %s\n",
+                   linea, $1);
+        }
+        printf("Asignacion a %s\n", $1);
     }
     | RETURN expr ';'
     {
-        printf("Sentencia return;\n");
+        printf("Sentencia return\n");
     }
-    | func_call ';'
+    | expr ';'
     {
-        printf("Llamada a funcion como sentencia;\n");
+        printf("Sentencia de expresion\n");
     }
     | ';'
     {
-        printf("Sentencia vacia;\n");
+        printf("Sentencia vacia\n");
     }
     | block
+    /* ====== ESTRUCTURAS SELECTIVAS ====== */
+    | IF '(' expr ')' stmt  %prec LOWER_THAN_ELSE
+    {
+        if ($3 == TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): condicion de if con tipo desconocido\n",
+                   linea);
+        }
+        printf("Sentencia if\n");
+    }
+    | IF '(' expr ')' stmt ELSE stmt
+    {
+        if ($3 == TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): condicion de if-else con tipo desconocido\n",
+                   linea);
+        }
+        printf("Sentencia if-else\n");
+    }
+    /* ====== ESTRUCTURAS ITERATIVAS ====== */
+    | WHILE '(' expr ')' stmt
+    {
+        if ($3 == TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): condicion de while con tipo desconocido\n",
+                   linea);
+        }
+        printf("Sentencia while\n");
+    }
+    | DO stmt WHILE '(' expr ')' ';'
+    {
+        if ($5 == TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): condicion de do-while con tipo desconocido\n",
+                   linea);
+        }
+        printf("Sentencia do-while\n");
+    }
+    | FOR '(' for_init_opt ';' for_cond_opt ';' for_iter_opt ')' stmt
+    {
+        printf("Sentencia for\n");
+    }
+    ;
+
+/* inicializacion del for: solo una asignacion simple opcional */
+for_init_opt:
+      /* vacio */
+    | ID '=' expr
+    {
+        Symbol *v = lookup_symbol($1);
+        if (!v) {
+            sem_error("asignacion en for a variable no declarada", $1);
+        } else if (v->kind != SYM_VAR) {
+            sem_error("asignacion en for a identificador que no es variable", $1);
+        } else if (v->type != $3 && $3 != TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): tipos distintos en asignacion en for a %s\n",
+                   linea, $1);
+        }
+    }
+    ;
+
+/* condicion del for: una expresion opcional */
+for_cond_opt:
+      /* vacio */
+    | expr
+    {
+        if ($1 == TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): condicion de for con tipo desconocido\n",
+                   linea);
+        }
+    }
+    ;
+
+/* actualizacion del for: asignacion o incremento opcional */
+for_iter_opt:
+      /* vacio */
+    | ID '=' expr
+    {
+        Symbol *v = lookup_symbol($1);
+        if (!v) {
+            sem_error("asignacion en iteracion de for a variable no declarada", $1);
+        } else if (v->kind != SYM_VAR) {
+            sem_error("asignacion en iteracion de for a identificador que no es variable", $1);
+        } else if (v->type != $3 && $3 != TYPE_UNKNOWN) {
+            printf("Advertencia semantica (linea %d): tipos distintos en asignacion en for a %s\n",
+                   linea, $1);
+        }
+    }
+    | ID INCREMENT
+    {
+        Symbol *v = lookup_symbol($1);
+        if (!v) {
+            sem_error("incremento en for de variable no declarada", $1);
+        } else if (v->kind != SYM_VAR) {
+            sem_error("incremento en for de identificador que no es variable", $1);
+        }
+    }
     ;
 
 /* llamada a funcion */
 func_call:
       ID '(' arg_list_opt ')'
     {
-        check_function_call($1, $3);
-        printf("Llamada a funcion;\n");
+        Symbol *f = lookup_symbol($1);
+        if (!f) {
+            sem_error("llamada a funcion no declarada", $1);
+        } else if (f->kind != SYM_FUNC) {
+            sem_error("identificador llamado como funcion pero no es funcion", $1);
+        } else if (f->param_count != $3) {
+            printf("Error semantico (linea %d): numero incorrecto de parametros en %s (esperado %d, recibido %d)\n",
+                   linea, $1, f->param_count, $3);
+            semantic_errors++;
+        }
+        printf("Llamada a funcion: %s\n", $1);
+        /* asumimos que las funciones devuelven int */
     }
     ;
 
 arg_list_opt:
-      /* vacio */        { $$ = 0; }
-    | arg_list
+      /* vacio */  { $$ = 0; }
+    | arg_list     { $$ = $1; }
     ;
 
 arg_list:
@@ -217,19 +465,141 @@ arg_list:
     | arg_list ',' expr  { $$ = $1 + 1; }
     ;
 
-/* expresiones aritmeticas: + y * */
+/* expresiones aritmeticas con precedencia */
 expr:
       expr '+' expr
-    | expr '*' expr
-    | NUMBER
-    | ID
-        {
-            check_var_use($1);
+    {
+        if ($1 != $3 && $1 != TYPE_UNKNOWN && $3 != TYPE_UNKNOWN) {
+            printf("Error semantico (linea %d): tipos incompatibles en suma\n", linea);
+            semantic_errors++;
         }
+        $$ = ($1 != TYPE_UNKNOWN) ? $1 : $3;
+    }
+    | expr '-' expr
+    {
+        if ($1 != $3 && $1 != TYPE_UNKNOWN && $3 != TYPE_UNKNOWN) {
+            printf("Error semantico (linea %d): tipos incompatibles en resta\n", linea);
+            semantic_errors++;
+        }
+        $$ = ($1 != TYPE_UNKNOWN) ? $1 : $3;
+    }
+    | expr '*' expr
+    {
+        if ($1 != $3 && $1 != TYPE_UNKNOWN && $3 != TYPE_UNKNOWN) {
+            printf("Error semantico (linea %d): tipos incompatibles en multiplicacion\n", linea);
+            semantic_errors++;
+        }
+        $$ = ($1 != TYPE_UNKNOWN) ? $1 : $3;
+    }
+    | expr '/' expr
+    {
+        if ($1 != $3 && $1 != TYPE_UNKNOWN && $3 != TYPE_UNKNOWN) {
+            printf("Error semantico (linea %d): tipos incompatibles en division\n", linea);
+            semantic_errors++;
+        }
+        $$ = ($1 != TYPE_UNKNOWN) ? $1 : $3;
+    }
+    | NUMBER
+    {
+        $$ = TYPE_INT;   /* constantes numericas como int */
+    }
+    | ID
+    {
+        Symbol *s = lookup_symbol($1);
+        if (!s) {
+            sem_error("uso de identificador no declarado", $1);
+            $$ = TYPE_UNKNOWN;
+        } else {
+            $$ = s->type;
+        }
+    }
     | func_call
+    {
+        $$ = TYPE_INT;   /* asumimos retorno int */
+    }
+    | '(' expr ')'
+    {
+        $$ = $2;
+    }
     ;
 
 %%
+
+/* ============================
+   IMPLEMENTACION FUNCIONES C
+   ============================ */
+
+void init_scopes(void) {
+    /* creamos scope global */
+    current_scope = (Scope*)malloc(sizeof(Scope));
+    current_scope->symbols = NULL;
+    current_scope->parent  = NULL;
+}
+
+void enter_scope(void) {
+    Scope *s = (Scope*)malloc(sizeof(Scope));
+    s->symbols = NULL;
+    s->parent  = current_scope;
+    current_scope = s;
+}
+
+void leave_scope(void) {
+    if (current_scope == NULL) return;
+    Scope *old = current_scope;
+    current_scope = current_scope->parent;
+    (void)old; /* para esta practica no liberamos memoria */
+}
+
+/* busca un simbolo en el scope actual y sus padres */
+Symbol *lookup_symbol(const char *name) {
+    Scope *sc = current_scope;
+    while (sc) {
+        Symbol *s = sc->symbols;
+        while (s) {
+            if (strcmp(s->name, name) == 0)
+                return s;
+            s = s->next;
+        }
+        sc = sc->parent;
+    }
+    return NULL;
+}
+
+/* busca un simbolo SOLO en el scope actual */
+Symbol *lookup_symbol_current(const char *name) {
+    if (!current_scope) return NULL;
+    Symbol *s = current_scope->symbols;
+    while (s) {
+        if (strcmp(s->name, name) == 0)
+            return s;
+        s = s->next;
+    }
+    return NULL;
+}
+
+/* agrega simbolo al scope actual */
+Symbol *add_symbol(const char *name, int kind, int type) {
+    if (!current_scope) {
+        fprintf(stderr, "Error interno: no hay scope actual para agregar simbolos.\n");
+        exit(1);
+    }
+    Symbol *s = (Symbol*)malloc(sizeof(Symbol));
+    s->name = strdup(name);
+    s->kind = kind;
+    s->type = type;
+    s->param_count = 0;
+    s->next = current_scope->symbols;
+    current_scope->symbols = s;
+    return s;
+}
+
+void sem_error(const char *msg, const char *id) {
+    if (id)
+        printf("Error semantico (linea %d): %s '%s'\n", linea, msg, id);
+    else
+        printf("Error semantico (linea %d): %s\n", linea, msg);
+    semantic_errors++;
+}
 
 int main(int argc, char *argv[]) {
     if (argc > 1) {
@@ -240,17 +610,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Iniciando analisis sintactico y semantico...\n");
-
+    /* inicializar scopes (crea scope global) */
     init_scopes();
 
+    /* registrar funcion builtin 'print(int)' para que input.c no marque error */
+    Symbol *builtin_print = add_symbol("print", SYM_FUNC, TYPE_INT);
+    builtin_print->param_count = 1;
+
+    printf("Iniciando analisis sintactico + semantico...\n");
+
     if (yyparse() == 0) {
-        if (semantic_errors == 0) {
-            printf("Analisis sintactico y semantico finalizado sin errores.\n");
-        } else {
-            printf("Analisis sintactico correcto, pero se encontraron %d errores semanticos.\n",
-                   semantic_errors);
-        }
+        printf("Analisis sintactico finalizado sin errores.\n");
     } else {
         printf("Analisis sintactico con errores.\n");
     }
@@ -260,120 +630,5 @@ int main(int argc, char *argv[]) {
 }
 
 void yyerror(const char *s) {
-    fprintf(stderr, "Error sintactico: %s\n", s);
-}
-
-/* ========= Implementacion de tabla de simbolos y scopes ========= */
-
-void semantic_error(const char *msg, const char *name) {
-    fprintf(stderr, "Error semantico: %s '%s'\n", msg, name);
-    semantic_errors++;
-}
-
-void init_scopes(void) {
-    current_scope = (Scope*)malloc(sizeof(Scope));
-    current_scope->symbols = NULL;
-    current_scope->parent = NULL;
-
-    /* Funcion builtin: print(x) para evitar error por no declararla */
-    Symbol *s = add_symbol("print", SYM_FUNC);
-    if (s) s->param_count = 1;
-}
-
-void enter_scope(void) {
-    Scope *s = (Scope*)malloc(sizeof(Scope));
-    s->symbols = NULL;
-    s->parent = current_scope;
-    current_scope = s;
-}
-
-void leave_scope(void) {
-    if (!current_scope) return;
-    Scope *s = current_scope;
-    current_scope = current_scope->parent;
-    /* Nota: por simplicidad no liberamos todos los Symbol* aqui */
-    free(s);
-}
-
-Symbol* lookup_symbol_current(const char *name) {
-    if (!current_scope) return NULL;
-    Symbol *sym = current_scope->symbols;
-    while (sym) {
-        if (strcmp(sym->name, name) == 0)
-            return sym;
-        sym = sym->next;
-    }
-    return NULL;
-}
-
-Symbol* lookup_symbol(const char *name) {
-    Scope *scope = current_scope;
-    while (scope) {
-        Symbol *sym = scope->symbols;
-        while (sym) {
-            if (strcmp(sym->name, name) == 0)
-                return sym;
-            sym = sym->next;
-        }
-        scope = scope->parent;
-    }
-    return NULL;
-}
-
-Symbol* add_symbol(const char *name, SymKind kind) {
-    if (!current_scope) return NULL;
-
-    /* redeclaracion en el mismo scope */
-    Symbol *exists = lookup_symbol_current(name);
-    if (exists) {
-        semantic_error("redeclaracion de identificador", name);
-        return exists;
-    }
-
-    Symbol *sym = (Symbol*)malloc(sizeof(Symbol));
-    sym->name = strdup(name);
-    sym->kind = kind;
-    sym->param_count = 0;
-    sym->next = current_scope->symbols;
-    current_scope->symbols = sym;
-    return sym;
-}
-
-void declare_variable(const char *name) {
-    add_symbol(name, SYM_VAR);
-}
-
-Symbol* declare_function(const char *name) {
-    return add_symbol(name, SYM_FUNC);
-}
-
-void declare_param(const char *name) {
-    Symbol *sym = add_symbol(name, SYM_VAR);
-    if (current_function && sym) {
-        current_function->param_count++;
-    }
-}
-
-void check_var_use(const char *name) {
-    Symbol *sym = lookup_symbol(name);
-    if (!sym) {
-        semantic_error("uso de variable no declarada", name);
-    } else if (sym->kind != SYM_VAR) {
-        semantic_error("identificador no es una variable", name);
-    }
-}
-
-void check_function_call(const char *name, int arg_count) {
-    Symbol *sym = lookup_symbol(name);
-    if (!sym) {
-        semantic_error("llamada a funcion no declarada", name);
-        return;
-    }
-    if (sym->kind != SYM_FUNC) {
-        semantic_error("identificador no es una funcion", name);
-        return;
-    }
-    if (sym->param_count != arg_count) {
-        semantic_error("numero de argumentos incorrecto en llamada a funcion", name);
-    }
+    printf("Error sintactico en linea %d: %s\n", linea, s);
 }
