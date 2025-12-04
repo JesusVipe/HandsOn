@@ -1,32 +1,76 @@
+/* parser.y */
 %{
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int yylex(void);
 void yyerror(const char *s);
 extern FILE *yyin;
+extern int linea;   /* contador de lineas definido en lexer.l */
 %}
 
-/* Tokens sin valores semanticos */
-%token INCLUDE INT RETURN ID NUMBER
+/* ------------------------------
+   VALORES SEMANTICOS
+   ------------------------------ */
+%union {
+    int ival;     /* para NUMBER */
+    char *str;    /* para ID */
+}
+
+/* ------------------------------
+   TOKENS (deben coincidir con lexer.l)
+   ------------------------------ */
+%token INCLUDE
+%token DEFINE
+
+%token INT FLOAT DOUBLE CHAR VOID SHORT
+%token RETURN
+
+%token IF ELSE
+%token INCREMENT
+
+%token <str> ID
+%token <ival> NUMBER
+
+/* Precedencia de operadores */
+%left '+' '-'
+%left '*' '/'
+
+%type <ival> expr
 
 %%
 
-/* programa = includes opcionales + declaraciones globales + funciones */
+/* programa = lineas de preprocesador + globales + funciones */
 program:
-      includes global_list function_list
+      preprocessor_opt global_list function_list
     {
         printf("=== Analisis sintactico completado ===\n");
     }
     ;
 
-/* lineas de include (opcionales) */
-includes:
+/* lineas de preprocesador: includes y defines (opcionales) */
+preprocessor_opt:
       /* vacio */
-    | includes INCLUDE
+    | preprocessor_opt preprocessor_line
     ;
 
-/* declaraciones globales */
+/* Aqui usamos los tokens que realmente produce tu lexer:
+   '#' INCLUDE '<' ID '.' ID '>' para #include <stdlib.h>
+   '#' DEFINE ID NUMBER        para #define SCALE_FACTOR 2
+*/
+preprocessor_line:
+      '#' INCLUDE '<' ID '.' ID '>'
+        { printf("Include: <%s.%s>\n", $4, $6); }
+    | '#' INCLUDE '<' ID '>'
+        { printf("Include: <%s>\n", $4); }
+    | '#' DEFINE ID NUMBER
+        { printf("Define: %s = %d\n", $3, $4); }
+    | '#' DEFINE ID
+        { printf("Define: %s\n", $3); }
+    ;
+
+/* declaraciones globales (opcionales) */
 global_list:
       /* vacio */
     | global_list global_decl
@@ -35,34 +79,35 @@ global_list:
 global_decl:
       type ID ';'
     {
-        printf("Declaracion global;\n");
-    }
-    | type ID '=' expr ';'
-    {
-        printf("Declaracion global con asignacion;\n");
+        printf("Declaracion global: %s\n", $2);
     }
     ;
 
-/* lista de funciones */
+/* tipos de dato */
+type:
+      INT
+    | FLOAT
+    | DOUBLE
+    | CHAR
+    | VOID
+    | SHORT
+    ;
+
+/* lista de funciones (al menos 1) */
 function_list:
       function_def
     | function_list function_def
     ;
 
-/* tipo base (solo int para simplificar) */
-type:
-      INT
-    ;
-
-/* definicion de funcion: int id ( params ) { ... } */
+/* definicion de funcion: tipo id (parametros) { ... } */
 function_def:
       type ID '(' param_list_opt ')' block
     {
-        printf("Funcion;\n");
+        printf("Funcion: %s\n", $2);
     }
     ;
 
-/* parametros de la funcion */
+/* parametros */
 param_list_opt:
       /* vacio */
     | param_list
@@ -76,15 +121,15 @@ param_list:
 param:
       type ID
     {
-        printf("Parametro;\n");
+        printf("Parametro: %s\n", $2);
     }
     ;
 
-/* bloque con vars locales y sentencias */
+/* bloque con declaraciones locales y sentencias */
 block:
       '{' local_decls stmt_list '}'
     {
-        printf("Bloque de codigo;\n");
+        printf("Bloque de codigo\n");
     }
     ;
 
@@ -96,11 +141,11 @@ local_decls:
 local_decl:
       type ID ';'
     {
-        printf("Variable local;\n");
+        printf("Variable local: %s\n", $2);
     }
     | type ID '=' expr ';'
     {
-        printf("Variable local con asignacion;\n");
+        printf("Variable local con asignacion: %s\n", $2);
     }
     ;
 
@@ -110,32 +155,33 @@ stmt_list:
     | stmt_list stmt
     ;
 
-/* sentencias (instrucciones) */
+/* sentencias */
 stmt:
-      ID '=' expr ';'          /* asignacion */
+      ID '=' expr ';'
     {
-        printf("Asignacion;\n");
+        printf("Asignacion a %s\n", $1);
     }
-    | RETURN expr ';'          /* return expr; */
+    | RETURN expr ';'
     {
-        printf("Sentencia return;\n");
+        printf("Sentencia return\n");
     }
-    | func_call ';'            /* llamada a funcion; */
+    | expr ';'
     {
-        printf("Llamada a funcion como sentencia;\n");
+        /* Sentencia de expresion, por ejemplo print(expr); */
+        printf("Sentencia de expresion\n");
     }
-    | ';'                      /* sentencia vacia */
+    | ';'
     {
-        printf("Sentencia vacia;\n");
+        printf("Sentencia vacia\n");
     }
-    | block                    /* bloque anidado */
+    | block
     ;
 
 /* llamada a funcion */
 func_call:
       ID '(' arg_list_opt ')'
     {
-        printf("Llamada a funcion;\n");
+        printf("Llamada a funcion: %s\n", $1);
     }
     ;
 
@@ -149,13 +195,16 @@ arg_list:
     | arg_list ',' expr
     ;
 
-/* expresiones aritmeticas: + y * */
+/* expresiones aritmeticas con precedencia */
 expr:
-      expr '+' expr
-    | expr '*' expr
-    | NUMBER
-    | ID
-    | func_call
+      expr '+' expr   { $$ = $1 + $3; }
+    | expr '-' expr   { $$ = $1 - $3; }
+    | expr '*' expr   { $$ = $1 * $3; }
+    | expr '/' expr   { $$ = $1 / $3; }
+    | NUMBER          { $$ = $1; }
+    | ID              { $$ = 0; }
+    | func_call       { $$ = 0; }
+    | '(' expr ')'    { $$ = $2; }
     ;
 
 %%
@@ -182,5 +231,5 @@ int main(int argc, char *argv[]) {
 }
 
 void yyerror(const char *s) {
-    fprintf(stderr, "Error sintactico: %s\n", s);
+    fprintf(stderr, "Error sintactico en linea %d: %s\n", linea, s);
 }
